@@ -7,8 +7,6 @@ const TimeAdjustmentRuleSchema = new Schema({
     timeAdjustment: { type: Number, required: true }
 }, { _id: false });
 
-// REMOVED: The WaypointSchema is no longer needed and has been deleted.
-
 const BusRouteSchema = new Schema({
     routeNumber: { type: String, required: true, trim: true },
     routeName: { type: String, required: true, trim: true },
@@ -16,6 +14,7 @@ const BusRouteSchema = new Schema({
     toTerminal: { type: String, required: true },
     leg1: { directionName: { type: String }, kilometers: { type: Number, required: true }, timePerKm: { type: Number, required: true } },
     leg2: { directionName: { type: String }, kilometers: { type: Number, required: true }, timePerKm: { type: Number, required: true } },
+    depotName: { type: String, trim: true },
     isTurnoutFromDepot: { type: Boolean, default: false },
     depotConnections: {
         timeFromDepotToStart: { type: Number },
@@ -24,12 +23,13 @@ const BusRouteSchema = new Schema({
         timeFromEndToDepot: { type: Number }
     },
     busesAssigned: { type: Number, required: true },
-    // REMOVED: recoveryTimeAtFromTerminal and recoveryTimeAtToTerminal are gone.
+    // REVERTED: Back to single serviceStartTime and dutyDurationHours
     serviceStartTime: { type: String, required: true },
-    serviceEndTime: { type: String, required: true },
+    dutyDurationHours: { type: Number, required: true, default: 8 }, 
+    numberOfShifts: { type: Number, required: true, default: 1 }, // NEW FIELD
     timeAdjustmentRules: [TimeAdjustmentRuleSchema],
-    // REMOVED: The waypoints array is gone.
     crewDutyRules: {
+        hasBreak: { type: Boolean, default: true },
         breakLocation: { type: String },
         breakDuration: { type: Number, default: 30 },
         breakWindowStart: { type: Number, default: 150 },
@@ -46,6 +46,7 @@ BusRouteSchema.pre('save', function(next) {
         this.leg2.directionName = `${this.toTerminal} to ${this.fromTerminal}`;
     }
     if (!this.isTurnoutFromDepot) {
+        this.depotName = undefined;
         this.depotConnections = undefined;
     }
     next();
