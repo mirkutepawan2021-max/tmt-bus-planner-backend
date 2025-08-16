@@ -1,8 +1,6 @@
 // backend/utils/scheduleCalculator.js
 
 function calculateLegDuration(kilometers, timePerKm) {
-    if (kilometers < 0) { throw new Error("Leg kilometers cannot be negative."); }
-    if (timePerKm <= 0) { throw new Error("Time per kilometer must be a positive value."); }
     return kilometers * timePerKm;
 }
 
@@ -10,32 +8,34 @@ function parseTimeToMinutes(timeValue) {
     if (typeof timeValue === 'number') return timeValue;
     if (typeof timeValue !== 'string' || !timeValue.includes(':')) {
         const num = Number(timeValue);
-        if (!isNaN(num)) return num;
-        return 0;
+        return isNaN(num) ? 0 : num;
     }
     const [hours, minutes] = timeValue.split(':').map(Number);
     return hours * 60 + minutes;
 }
 
 function formatMinutesToTime(totalMinutes) {
-    totalMinutes = (totalMinutes % 1440 + 1440) % 1440;
-    const hours = Math.floor(totalMinutes / 60);
-    const minutes = totalMinutes % 60;
+    totalMinutes = Math.round(totalMinutes);
+    const dayMinutes = totalMinutes % 1440;
+    const hours = Math.floor(dayMinutes / 60);
+    const minutes = dayMinutes % 60;
     return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
 }
 
 function applyTimeAdjustments(tripStartTimeMinutes, baseTripDurationMinutes, adjustmentRules) {
     let adjustedDuration = baseTripDurationMinutes;
-    if (!Array.isArray(adjustmentRules)) { return adjustedDuration; }
+    if (!Array.isArray(adjustmentRules)) return adjustedDuration;
+    const tripStartDayMinutes = tripStartTimeMinutes % 1440;
+
     adjustmentRules.forEach(rule => {
         const ruleStartTime = parseTimeToMinutes(rule.startTime);
         const ruleEndTime = parseTimeToMinutes(rule.endTime);
         if (ruleStartTime <= ruleEndTime) {
-            if (tripStartTimeMinutes >= ruleStartTime && tripStartTimeMinutes < ruleEndTime) {
+            if (tripStartDayMinutes >= ruleStartTime && tripStartDayMinutes < ruleEndTime) {
                 adjustedDuration += rule.timeAdjustment;
             }
         } else {
-            if (tripStartTimeMinutes >= ruleStartTime || tripStartTimeMinutes < ruleEndTime) {
+            if (tripStartDayMinutes >= ruleStartTime || tripStartDayMinutes < ruleEndTime) {
                 adjustedDuration += rule.timeAdjustment;
             }
         }
@@ -43,192 +43,145 @@ function applyTimeAdjustments(tripStartTimeMinutes, baseTripDurationMinutes, adj
     return adjustedDuration;
 }
 
-function generateSingleBusDutySchedule(routeDetails, busShiftId, serviceStartTimeMinutes, dutyDurationMinutes) {
-    const {
-        fromTerminal, toTerminal, leg1, leg2,
-        timeAdjustmentRules, crewDutyRules, depotName,
-        isTurnoutFromDepot, depotConnections
-    } = routeDetails;
-
-    const warnings = []; 
-    const targetDutyEndTimeAbsolute = serviceStartTimeMinutes + dutyDurationMinutes;
-    const CHECKING_TIME_DURATION = 15;
-    const MIN_DUTY_DURATION = 7 * 60;
-
-    let preTripEvents = [];
-    let currentBusTime = serviceStartTimeMinutes;
-    preTripEvents.push({ type: 'Calling Time', time: formatMinutesToTime(currentBusTime), location: depotName, rawTime: currentBusTime });
-    currentBusTime += 15;
-    preTripEvents.push({ type: 'Preparation', time: formatMinutesToTime(currentBusTime), location: depotName, rawTime: currentBusTime });
-
-    if (isTurnoutFromDepot) {
-        const timeToStart = depotConnections.timeFromDepotToStart || 0;
-        preTripEvents.push({ type: 'Depot Movement', subType: 'Departure', time: formatMinutesToTime(currentBusTime), location: depotName, rawTime: currentBusTime });
-        currentBusTime += timeToStart;
-        preTripEvents.push({ type: 'Depot Movement', subType: 'Arrival', time: formatMinutesToTime(currentBusTime), location: fromTerminal, rawTime: currentBusTime });
-    }
-
-    let trips = [];
-    let tripCounter = 0;
-    while (true) {
-        tripCounter++;
-        let tripStartTime = currentBusTime;
-        const timeToDepotFromStart = isTurnoutFromDepot ? (depotConnections.timeFromStartToDepot || 0) : 0;
-        const timeToDepotFromEnd = isTurnoutFromDepot ? (depotConnections.timeFromEndToDepot || 0) : 0;
-        const baseLeg1Duration = calculateLegDuration(leg1.kilometers, leg1.timePerKm);
-        const baseLeg2Duration = leg2 ? calculateLegDuration(leg2.kilometers, leg2.timePerKm) : 0;
-        const adjustedLeg1Dur = applyTimeAdjustments(tripStartTime, baseLeg1Duration, timeAdjustmentRules);
-        const leg2StartTime = tripStartTime + adjustedLeg1Dur;
-        const adjustedLeg2Dur = baseLeg2Duration > 0 ? applyTimeAdjustments(leg2StartTime, baseLeg2Duration, timeAdjustmentRules) : 0;
-        const adjustedRoundTripDur = adjustedLeg1Dur + adjustedLeg2Dur;
-        const costOfFullTrip = adjustedRoundTripDur + timeToDepotFromStart + CHECKING_TIME_DURATION;
-        const costOfHalfTrip = adjustedLeg1Dur + timeToDepotFromEnd + CHECKING_TIME_DURATION;
-        
-        let tripEvent = null;
-        if (baseLeg2Duration > 0 && (tripStartTime + costOfFullTrip <= targetDutyEndTimeAbsolute)) {
-            tripEvent = {
-                type: 'Trip', tripNumber: tripCounter,
-                legs: [
-                    { legNumber: 1, departureTime: formatMinutesToTime(tripStartTime), departureLocation: fromTerminal, arrivalTime: formatMinutesToTime(leg2StartTime), arrivalLocation: toTerminal },
-                    { legNumber: 2, departureTime: formatMinutesToTime(leg2StartTime), departureLocation: toTerminal, arrivalTime: formatMinutesToTime(leg2StartTime + adjustedLeg2Dur), arrivalLocation: fromTerminal }
-                ],
-                rawDepartureTime: tripStartTime, rawArrivalTime: leg2StartTime + adjustedLeg2Dur
-            };
-        } else if (tripStartTime + costOfHalfTrip <= targetDutyEndTimeAbsolute) {
-             tripEvent = {
-                type: 'Trip', tripNumber: tripCounter,
-                legs: [{ legNumber: 1, departureTime: formatMinutesToTime(tripStartTime), departureLocation: fromTerminal, arrivalTime: formatMinutesToTime(tripStartTime + adjustedLeg1Dur), arrivalLocation: toTerminal }],
-                rawDepartureTime: tripStartTime, rawArrivalTime: tripStartTime + adjustedLeg1Dur
-            };
-        } else {
-            break;
-        }
-        trips.push(tripEvent);
-        currentBusTime = tripEvent.rawArrivalTime;
-    }
-
-    let combinedEvents = [...preTripEvents, ...trips];
-    let breakInserted = false;
-
-    if (crewDutyRules.hasBreak) {
-        let breakInsertionIndex = -1;
-        let breakStartTime = 0;
-        
-        for (let i = 0; i < combinedEvents.length; i++) {
-            const event = combinedEvents[i];
-            if (event.type === 'Trip') {
-                for(const leg of event.legs) {
-                    const arrivalTime = parseTimeToMinutes(leg.arrivalTime);
-                    const elapsedTime = arrivalTime - serviceStartTimeMinutes;
-                    
-                    if (leg.arrivalLocation === crewDutyRules.breakLocation && 
-                        elapsedTime >= crewDutyRules.breakWindowStart && 
-                        elapsedTime <= crewDutyRules.breakWindowEnd) 
-                    {
-                        breakInsertionIndex = i + 1;
-                        breakStartTime = arrivalTime;
-                        break;
-                    }
-                }
-            }
-            if(breakInsertionIndex !== -1) break;
-        }
-        
-        if (breakInsertionIndex !== -1) {
-            const breakDuration = crewDutyRules.breakDuration;
-            const breakLayover = crewDutyRules.breakLayoverDuration || 0;
-            const totalBreakImpact = breakDuration + breakLayover;
-            
-            const breakEvent = {
-                type: 'Break', startTime: formatMinutesToTime(breakStartTime), endTime: formatMinutesToTime(breakStartTime + breakDuration),
-                location: crewDutyRules.breakLocation, description: `Break @ ${crewDutyRules.breakLocation}`,
-                duration: breakDuration, layover: breakLayover, rawTime: breakStartTime
-            };
-            
-            combinedEvents.splice(breakInsertionIndex, 0, breakEvent);
-            
-            for (let i = breakInsertionIndex; i < combinedEvents.length; i++) {
-                let event = combinedEvents[i];
-                 if(i > breakInsertionIndex) {
-                    if (event.type === 'Trip') {
-                        event.rawDepartureTime += totalBreakImpact;
-                        event.rawArrivalTime += totalBreakImpact;
-                        event.legs.forEach(leg => {
-                            leg.departureTime = formatMinutesToTime(parseTimeToMinutes(leg.departureTime) + totalBreakImpact);
-                            leg.arrivalTime = formatMinutesToTime(parseTimeToMinutes(leg.arrivalTime) + totalBreakImpact);
-                        });
-                    } else if (event.rawTime) {
-                        event.rawTime += totalBreakImpact;
-                        event.time = formatMinutesToTime(event.rawTime);
-                    }
-                 }
-            }
-            breakInserted = true;
-        }
-    }
-
-    let finalEvents = combinedEvents;
-    const lastEvent = finalEvents.length > 0 ? finalEvents[finalEvents.length - 1] : null;
-    currentBusTime = lastEvent ? (lastEvent.rawArrivalTime || lastEvent.rawTime || parseTimeToMinutes(lastEvent.endTime)) : currentBusTime;
-    let lastKnownLocation = lastEvent ? (lastEvent.legs ? lastEvent.legs[lastEvent.legs.length - 1].arrivalLocation : lastEvent.location) : fromTerminal;
-
-    if (isTurnoutFromDepot && lastKnownLocation !== depotName) {
-        const timeToDepotFromStart = depotConnections.timeFromStartToDepot || 0;
-        const timeToDepotFromEnd = depotConnections.timeFromEndToDepot || 0;
-        const timeToDepotNow = (lastKnownLocation === fromTerminal) ? timeToDepotFromStart : timeToDepotFromEnd;
-        if (currentBusTime + timeToDepotNow + CHECKING_TIME_DURATION <= targetDutyEndTimeAbsolute) {
-             finalEvents.push({
-                type: 'Trip to Depot', description: `Final return to ${depotName} from ${lastKnownLocation}`,
-                departureTime: formatMinutesToTime(currentBusTime), departureLocation: lastKnownLocation,
-                arrivalTime: formatMinutesToTime(currentBusTime + timeToDepotNow), arrivalLocation: depotName
-            });
-            currentBusTime += timeToDepotNow;
-        }
-    }
-    
-    if (crewDutyRules.hasBreak && !breakInserted) {
-        warnings.push(`CRITICAL: A mandatory break could not be scheduled within the required window.`);
-    }
-
-    let finalDutyTime = Math.max(currentBusTime + CHECKING_TIME_DURATION, serviceStartTimeMinutes + MIN_DUTY_DURATION);
-    finalEvents.push({ type: 'Checking Time', time: formatMinutesToTime(finalDutyTime - CHECKING_TIME_DURATION), location: depotName });
-    finalEvents.push({ type: 'Duty End', time: formatMinutesToTime(finalDutyTime), location: depotName });
-
-    return { busShiftId, schedule: finalEvents, warnings };
-}
-
+// --- *** FINAL, TRUE SEQUENTIAL DISPATCHER ENGINE *** ---
 function generateFullRouteSchedule(routeDetails) {
-    const { busesAssigned, serviceStartTime, dutyDurationHours, numberOfShifts, leg1, leg2 } = routeDetails;
-    const allSchedules = {};
-    const overallWarnings = [];
-
-    if (!busesAssigned || !numberOfShifts) {
-        overallWarnings.push("Buses Assigned and Number of Shifts must be greater than 0.");
-        return { schedules: {}, warnings: overallWarnings };
-    }
+    const {
+        fromTerminal, toTerminal, leg1, leg2, busesAssigned, numberOfShifts,
+        serviceStartTime, dutyDurationHours, timeAdjustmentRules, crewDutyRules
+    } = routeDetails;
     
+    const overallWarnings = [];
+    if (!busesAssigned || busesAssigned <= 0) {
+        return { schedules: {}, warnings: ["Buses Assigned must be greater than 0."] };
+    }
+
     const baseLeg1Dur = calculateLegDuration(leg1.kilometers, leg1.timePerKm);
     const baseLeg2Dur = leg2 ? calculateLegDuration(leg2.kilometers, leg2.timePerKm) : 0;
-    const baseRoundTripDuration = baseLeg1Dur + baseLeg2Dur;
-    const frequencyMinutes = Math.ceil((baseRoundTripDuration > 0 ? baseRoundTripDuration : baseLeg1Dur) / busesAssigned);
-    let shiftStartTimeMinutes = parseTimeToMinutes(serviceStartTime);
-    const dutyDurationMinutes = dutyDurationHours * 60;
+    
+    // 1. Initialize Bus States
+    let busStates = [];
+    for (let i = 0; i < busesAssigned * numberOfShifts; i++) {
+        const busNumber = (i % busesAssigned) + 1;
+        const shiftNumber = Math.floor(i / busesAssigned) + 1;
+        const dutyStart = parseTimeToMinutes(serviceStartTime) + (shiftNumber - 1) * (dutyDurationHours * 60);
+        
+        const busState = {
+            id: `Bus ${busNumber} - S${shiftNumber}`,
+            schedule: [],
+            location: fromTerminal,
+            availableFromTime: dutyStart + 15, // Ready after prep
+            dutyStartTime: dutyStart,
+            dutyEndTime: dutyStart + (dutyDurationHours * 60),
+            breakTaken: false,
+            tripCount: 0,
+            isDone: false,
+        };
+        busState.schedule.push({ type: 'Calling Time', time: formatMinutesToTime(dutyStart), rawTime: dutyStart });
+        busState.schedule.push({ type: 'Preparation', time: formatMinutesToTime(dutyStart + 15), rawTime: dutyStart + 15 });
+        busStates.push(busState);
+    }
+    
+    // 2. Dispatcher Loop
+    const lastDepartureTimes = { [fromTerminal]: -1, [toTerminal]: -1 };
+    let continueScheduling = true;
 
-    for (let shiftIndex = 0; shiftIndex < numberOfShifts; shiftIndex++) {
-        const shiftName = `S${shiftIndex + 1}`;
-        allSchedules[shiftName] = {};
-        for (let i = 0; i < busesAssigned; i++) {
-            const busStartTime = shiftStartTimeMinutes + (i * frequencyMinutes);
-            const busShiftId = `Bus ${i + 1} - ${shiftName}`;
-            const { schedule, warnings: singleBusWarnings } = generateSingleBusDutySchedule(routeDetails, busShiftId, busStartTime, dutyDurationMinutes);
-            allSchedules[shiftName][busShiftId] = schedule;
-            if (singleBusWarnings.length > 0) {
-                overallWarnings.push(...singleBusWarnings.map(w => `[${busShiftId}] ${w}`));
+    while (continueScheduling) {
+        // Find the bus with the absolute earliest availability time
+        const nextBusIdx = busStates
+            .map((bus, index) => ({ ...bus, index }))
+            .filter(b => !b.isDone)
+            .sort((a, b) => a.availableFromTime - b.availableFromTime)[0]?.index;
+
+        if (nextBusIdx === undefined) {
+            continueScheduling = false;
+            break;
+        }
+
+        const busToDispatch = busStates[nextBusIdx];
+        const departureLocation = busToDispatch.location;
+        const arrivalLocation = departureLocation === fromTerminal ? toTerminal : fromTerminal;
+        const isReturnTrip = departureLocation === toTerminal;
+        
+        const baseLegDur = isReturnTrip ? baseLeg2Dur : baseLeg1Dur;
+        if (baseLegDur <= 0 && isReturnTrip) {
+            busToDispatch.isDone = true;
+            continue;
+        }
+        
+        // --- Dynamic Headway & Cascading Delay ---
+        const tempDepartureTime = busToDispatch.availableFromTime;
+        const tempLeg1 = applyTimeAdjustments(tempDepartureTime, baseLeg1Dur, timeAdjustmentRules);
+        const tempLeg2 = baseLeg2Dur > 0 ? applyTimeAdjustments(tempDepartureTime + tempLeg1, baseLeg2Dur, timeAdjustmentRules) : 0;
+        const currentRoundTripTime = tempLeg1 + tempLeg2;
+        const headway = Math.ceil((currentRoundTripTime > 0 ? currentRoundTripTime : tempLeg1) / busesAssigned);
+        
+        const idealDepartureTime = (lastDepartureTimes[departureLocation] > -1) ? lastDepartureTimes[departureLocation] + headway : tempDepartureTime;
+        const actualDepartureTime = Math.max(idealDepartureTime, busToDispatch.availableFromTime);
+
+        if (actualDepartureTime >= busToDispatch.dutyEndTime) {
+            busToDispatch.isDone = true;
+            continue;
+        }
+
+        lastDepartureTimes[departureLocation] = actualDepartureTime;
+        
+        // --- Calculate One Leg of the Trip ---
+        const legDuration = applyTimeAdjustments(actualDepartureTime, baseLegDur, timeAdjustmentRules);
+        const legEndTime = actualDepartureTime + legDuration;
+        
+        if (legEndTime >= busToDispatch.dutyEndTime) {
+             busToDispatch.isDone = true;
+             continue;
+        }
+        
+        // --- Add Trip to Schedule ---
+        const legEvent = { legNumber: isReturnTrip ? 2 : 1, departureTime: formatMinutesToTime(actualDepartureTime), departureLocation, arrivalTime: formatMinutesToTime(legEndTime), arrivalLocation };
+        
+        // Group legs into a single trip event
+        const lastEvent = busToDispatch.schedule[busToDispatch.schedule.length-1];
+        if (isReturnTrip && lastEvent && lastEvent.type === 'Trip' && lastEvent.legs.length === 1) {
+            lastEvent.legs.push(legEvent);
+            lastEvent.rawArrivalTime = legEndTime;
+        } else {
+            busToDispatch.tripCount++;
+            busToDispatch.schedule.push({ type: 'Trip', tripNumber: busToDispatch.tripCount, legs: [legEvent], rawDepartureTime: actualDepartureTime, rawArrivalTime: legEndTime });
+        }
+        
+        let newAvailableTime = legEndTime;
+
+        // --- Handle Break ---
+        if (crewDutyRules.hasBreak && !busToDispatch.breakTaken && arrivalLocation === crewDutyRules.breakLocation) {
+            const elapsedTime = newAvailableTime - busToDispatch.dutyStartTime;
+            if (elapsedTime >= crewDutyRules.breakWindowStart && elapsedTime <= crewDutyRules.breakWindowEnd) {
+                const breakEndTime = newAvailableTime + crewDutyRules.breakDuration;
+                if (breakEndTime < busToDispatch.dutyEndTime) {
+                    busToDispatch.schedule.push({ type: 'Break', startTime: formatMinutesToTime(newAvailableTime), endTime: formatMinutesToTime(breakEndTime), location: arrivalLocation, rawTime: newAvailableTime });
+                    newAvailableTime = breakEndTime;
+                    busToDispatch.breakTaken = true;
+                }
             }
         }
-        shiftStartTimeMinutes += dutyDurationMinutes;
+        
+        busToDispatch.location = arrivalLocation;
+        busToDispatch.availableFromTime = newAvailableTime;
     }
-    return { schedules: allSchedules, warnings: overallWarnings };
+    
+    // 3. Finalize Schedules
+    busStates.forEach(bus => {
+        bus.schedule.sort((a,b) => (a.rawTime || a.rawDepartureTime) - (b.rawTime || b.rawDepartureTime));
+        bus.schedule.push({ type: 'Checking Time', time: formatMinutesToTime(bus.dutyEndTime - 15) });
+        bus.schedule.push({ type: 'Duty End', time: formatMinutesToTime(bus.dutyEndTime) });
+    });
+
+    // 4. Reformat for Frontend
+    const finalSchedules = {};
+    busStates.forEach(bus => {
+        const [busId, shiftId] = bus.id.split(' - ');
+        if (!finalSchedules[shiftId]) finalSchedules[shiftId] = {};
+        finalSchedules[shiftId][bus.id] = bus.schedule;
+    });
+
+    return { schedules: finalSchedules, warnings: overallWarnings };
 }
 
 module.exports = { generateFullRouteSchedule };
