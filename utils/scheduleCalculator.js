@@ -79,7 +79,7 @@ function generateFullRouteSchedule(routeDetails) {
                 id: `Bus ${busIndex + 1} - S${shiftIndex + 1}`, schedule: [],
                 location: isTurnoutFromDepot ? depotName : fromTerminal,
                 availableFromTime: dutyStart, dutyStartTime: dutyStart,
-                dutyEndTime: dutyStart + (dutyHours * 60),
+                dutyEndTime: dutyStart + (dutyHours * 60), // This is the hard limit
                 breakTaken: false, tripCount: 0, isDone: false,
             };
             busState.schedule.push({ type: 'Calling Time', time: formatMinutesToTime(dutyStart), rawTime: dutyStart });
@@ -125,6 +125,8 @@ function generateFullRouteSchedule(routeDetails) {
         const legEndTime = actualDepartureTime + legDuration;
         const arrivalLocation = isReturnTrip ? fromTerminal : toTerminal;
         
+        const checkingInDuration = 15;
+        const lastTripEndTimeAllowed = busToDispatch.dutyEndTime - checkingInDuration;
         let timeToReturnToDepot = 0;
         if (isTurnoutFromDepot) {
             timeToReturnToDepot = arrivalLocation === fromTerminal 
@@ -132,7 +134,7 @@ function generateFullRouteSchedule(routeDetails) {
                 : (parseFloat(depotConnections.timeFromEndToDepot) || 0);
         }
 
-        if (legEndTime + timeToReturnToDepot >= busToDispatch.dutyEndTime) {
+        if (legEndTime + timeToReturnToDepot > lastTripEndTimeAllowed) {
             busToDispatch.isDone = true; continue;
         }
 
@@ -164,23 +166,27 @@ function generateFullRouteSchedule(routeDetails) {
         busToDispatch.availableFromTime = newAvailableTime;
     }
     
-    // THE DEFINITIVE FIX FOR DYNAMIC CHECKING/DUTY END TIMES
+    // THE DEFINITIVE FIX FOR DYNAMIC DUTY END
     busStates.forEach(bus => {
+        let finalAvailableTime = bus.availableFromTime;
         if (isTurnoutFromDepot && bus.location !== depotName) {
             const timeToDepot = bus.location === fromTerminal ? (parseFloat(depotConnections.timeFromStartToDepot) || 0) : (parseFloat(depotConnections.timeFromEndToDepot) || 0);
             const arrivalAtDepotTime = bus.availableFromTime + timeToDepot;
-            if (timeToDepot > 0 && arrivalAtDepotTime <= bus.dutyEndTime) {
-                 bus.schedule.push({ type: 'Trip to Depot', legs: [{departureTime: formatMinutesToTime(bus.availableFromTime), arrivalTime: formatMinutesToTime(arrivalAtDepotTime), rawDepartureTime: bus.availableFromTime, rawArrivalTime: arrivalAtDepotTime}], rawDepartureTime: bus.availableFromTime, rawArrivalTime: arrivalAtDepotTime });
-                 bus.availableFromTime = arrivalAtDepotTime;
+            if (timeToDepot > 0 && arrivalAtDepotTime <= bus.dutyEndTime - 15) {
+                 bus.schedule.push({ type: 'Trip to Depot', legs: [{departureTime: formatMinutesToTime(bus.availableFromTime), arrivalTime: formatMinutesToTime(arrivalAtDepotTime), rawDepartureTime: bus.availableFromTime, rawArrivalTime: arrivalAtDepotTime}], rawDepartureTime: bus.availableFromTime });
+                 finalAvailableTime = arrivalAtDepotTime;
             }
         }
 
-        const actualWorkEndTime = bus.availableFromTime;
-        const plannedCheckingTime = bus.dutyEndTime - 15;
-        const actualCheckingTime = Math.max(actualWorkEndTime, plannedCheckingTime);
+        const checkingTimeStart = finalAvailableTime;
+        const potentialDutyEnd = checkingTimeStart + 15;
+        // The actual duty end is the EARLIER of the calculated end time or the hard 8-hour limit.
+        const actualDutyEndTime = Math.min(potentialDutyEnd, bus.dutyEndTime);
 
-        bus.schedule.push({ type: 'Checking Time', time: formatMinutesToTime(actualCheckingTime), rawTime: actualCheckingTime });
-        bus.schedule.push({ type: 'Duty End', time: formatMinutesToTime(actualCheckingTime + 15), rawTime: actualCheckingTime + 15 });
+        // Checking Time starts immediately after the last task.
+        bus.schedule.push({ type: 'Checking Time', time: formatMinutesToTime(checkingTimeStart), rawTime: checkingTimeStart });
+        // Duty End is 15 minutes after checking, but cannot exceed the original 8-hour limit.
+        bus.schedule.push({ type: 'Duty End', time: formatMinutesToTime(actualDutyEndTime), rawTime: actualDutyEndTime });
         
         bus.schedule.sort((a,b) => (a.rawTime ?? a.rawDepartureTime) - (b.rawTime ?? b.rawDepartureTime));
     });
