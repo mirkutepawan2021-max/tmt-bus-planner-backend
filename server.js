@@ -1,10 +1,11 @@
+// server.js
+
 const express = require('express');
 const mongoose = require('mongoose');
 const BusRoute = require('./models/BusRoute');
 const cors = require('cors');
 require('dotenv').config();
-
-// Import our schedule calculation utilities
+console.log('Mongo URI:', process.env.MONGO_URI);
 const { generateFullRouteSchedule } = require('./utils/scheduleCalculator');
 
 const app = express();
@@ -64,22 +65,33 @@ app.post('/api/bus-routes', async (req, res) => {
     }
 });
 
+// --- FIXED PUT ROUTE ---
 // PUT: Update an existing route
 app.put('/api/bus-routes/:id', async (req, res) => {
     try {
-        const route = await BusRoute.findById(req.params.id);
-        if (!route) {
-            console.warn(`Route ID ${req.params.id} not found for update.`);
+        const { id } = req.params;
+        const updateData = req.body;
+        console.log(updateData);
+        // Use findByIdAndUpdate for a more robust and direct update.
+        // The { new: true } option ensures the updated document is returned.
+        const updatedRoute = await BusRoute.findByIdAndUpdate(
+            id, 
+            { $set: updateData }, // Use $set to ensure all fields, including nested ones, are updated
+            { new: true, runValidators: true }
+        );
+
+        if (!updatedRoute) {
+            console.warn(`Route ID ${id} not found for update.`);
             return res.status(404).json({ message: 'Route not found' });
         }
-
-        Object.assign(route, req.body);
-        
-        const updatedRoute = await route.save();
         res.json(updatedRoute);
     } catch (err) {
         console.error(`Error updating route ${req.params.id}:`, err);
-        res.status(400).json({ message: err.message });
+        // Add more detailed error logging
+        if (err.name === 'ValidationError') {
+            return res.status(400).json({ message: 'Validation Error', errors: err.errors });
+        }
+        res.status(500).json({ message: err.message });
     }
 });
 
@@ -94,27 +106,21 @@ app.delete('/api/bus-routes/:id', async (req, res) => {
     }
 });
 
-// NEW API ENDPOINT: Generate Schedule for a Route
+// GET: Generate Schedule for a Route
 app.get('/api/bus-routes/:id/schedule', async (req, res) => {
-    console.log(`[SERVER] Received request for schedule for route ID: ${req.params.id}`);
     try {
         const route = await BusRoute.findById(req.params.id);
         if (!route) {
-            console.warn(`[SERVER] Route ID ${req.params.id} not found for schedule generation.`);
             return res.status(404).json({ message: 'Cannot find route' });
         }
-
-        console.log(`[SERVER] Raw Route fetched: ${JSON.stringify(route.toObject(), null, 2)}`);
-
-        // Create a cleaned and prepared route object for the scheduler
+       
         const cleanedRoute = {
             ...route.toObject(),
             leg1: { ...route.leg1.toObject(), kilometers: Number(route.leg1.kilometers), timePerKm: Number(route.leg1.timePerKm) },
             leg2: { ...route.leg2.toObject(), kilometers: Number(route.leg2.kilometers), timePerKm: Number(route.leg2.timePerKm) },
             busesAssigned: Number(route.busesAssigned),
-            serviceStartTime: route.serviceStartTime,
             dutyDurationHours: Number(route.dutyDurationHours),
-            numberOfShifts: Number(route.numberOfShifts), // Ensure this is converted to Number
+            numberOfShifts: Number(route.numberOfShifts),
             depotConnections: {
                 timeFromDepotToStart: Number(route.depotConnections?.timeFromDepotToStart || 0),
                 timeFromDepotToEnd: Number(route.depotConnections?.timeFromDepotToEnd || 0),
@@ -122,33 +128,23 @@ app.get('/api/bus-routes/:id/schedule', async (req, res) => {
                 timeFromEndToDepot: Number(route.depotConnections?.timeFromEndToDepot || 0)
             },
             crewDutyRules: {
-                ...route.crewDutyRules.toObject(),
-                hasBreak: route.crewDutyRules?.hasBreak,
+                ...(route.crewDutyRules ? route.crewDutyRules.toObject() : {}),
                 breakDuration: Number(route.crewDutyRules?.breakDuration),
                 breakWindowStart: Number(route.crewDutyRules?.breakWindowStart),
                 breakWindowEnd: Number(route.crewDutyRules?.breakWindowEnd),
                 breakLayoverDuration: Number(route.crewDutyRules?.breakLayoverDuration)
             },
-            timeAdjustmentRules: route.timeAdjustmentRules.map(rule => ({
-                startTime: rule.startTime,
-                endTime: rule.endTime,
+            timeAdjustmentRules: (route.timeAdjustmentRules || []).map(rule => ({
+                ...rule.toObject(),
                 timeAdjustment: Number(rule.timeAdjustment)
-            }))
+            })),
+            frequency: {
+                type: route.frequency?.type || 'standard',
+                dynamicMinutes: Number(route.frequency?.dynamicMinutes || 0)
+            }
         };
-        if (!cleanedRoute.timeAdjustmentRules || cleanedRoute.timeAdjustmentRules.length === 0) {
-            cleanedRoute.timeAdjustmentRules = [];
-        }
-
-        console.log(`[SERVER] Cleaned route for scheduler: ${JSON.stringify(cleanedRoute, null, 2)}`);
-        // --- DEBUG LOG START ---
-        console.log(`[SERVER DEBUG] numberOfShifts being passed to generateFullRouteSchedule: ${cleanedRoute.numberOfShifts}`);
-        // --- DEBUG LOG END ---
-
+        
         const { schedules, warnings } = generateFullRouteSchedule(cleanedRoute);
-
-        console.log(`[SERVER] Schedule generated: ${JSON.stringify(schedules, null, 2)}`);
-        console.log(`[SERVER] Scheduling warnings: ${JSON.stringify(warnings, null, 2)}`);
-
         res.json({ schedules, warnings });
 
     } catch (err) {

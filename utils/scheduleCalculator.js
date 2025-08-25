@@ -1,4 +1,5 @@
 // backend/utils/scheduleCalculator.js
+
 function calculateLegDuration(kilometers, timePerKm) {
     return kilometers * timePerKm;
 }
@@ -44,21 +45,32 @@ function applyTimeAdjustments(tripStartTimeMinutes, baseTripDurationMinutes, adj
 }
 
 function generateFullRouteSchedule(routeDetails) {
-    const fromTerminal = routeDetails.fromTerminal || 'Start';
-    const toTerminal = routeDetails.toTerminal || 'End';
-    const numBuses = parseInt(routeDetails.busesAssigned, 10) || 1;
-    const numShifts = parseInt(routeDetails.numberOfShifts, 10) || 1;
-    const dutyHours = parseFloat(routeDetails.dutyDurationHours) || 8;
-    const leg1Km = parseFloat(routeDetails.leg1?.kilometers) || 0;
-    const leg1Tpk = parseFloat(routeDetails.leg1?.timePerKm) || 0;
-    const leg2Km = parseFloat(routeDetails.leg2?.kilometers) || 0;
-    const leg2Tpk = parseFloat(routeDetails.leg2?.timePerKm) || 0;
-    const serviceStartTime = routeDetails.serviceStartTime || '00:00';
-    const timeAdjustmentRules = routeDetails.timeAdjustmentRules || [];
-    const crewDutyRules = routeDetails.crewDutyRules || {};
-    const isTurnoutFromDepot = routeDetails.isTurnoutFromDepot || false;
-    const depotName = routeDetails.depotName || 'Depot';
-    const depotConnections = routeDetails.depotConnections || {};
+    const {
+        fromTerminal = 'Start',
+        toTerminal = 'End',
+        busesAssigned,
+        numberOfShifts,
+        dutyDurationHours,
+        leg1,
+        leg2,
+        serviceStartTime = '00:00',
+        timeAdjustmentRules = [],
+        crewDutyRules = {},
+        isTurnoutFromDepot = false,
+        depotName = 'Depot',
+        depotConnections = {},
+        frequency: frequencyDetails,
+        hasDynamicSecondShift = false,
+        secondShiftStartTime
+    } = routeDetails;
+
+    const numBuses = parseInt(busesAssigned, 10) || 1;
+    const numShifts = parseInt(numberOfShifts, 10) || 1;
+    const dutyHours = parseFloat(dutyDurationHours) || 8;
+    const leg1Km = parseFloat(leg1?.kilometers) || 0;
+    const leg1Tpk = parseFloat(leg1?.timePerKm) || 0;
+    const leg2Km = parseFloat(leg2?.kilometers) || 0;
+    const leg2Tpk = parseFloat(leg2?.timePerKm) || 0;
 
     if (numBuses <= 0) return { schedules: {}, warnings: ["Buses Assigned must be greater than 0."] };
 
@@ -66,17 +78,43 @@ function generateFullRouteSchedule(routeDetails) {
     const baseLeg2Dur = calculateLegDuration(leg2Km, leg2Tpk);
     const totalRoundTripDuration = baseLeg1Dur + baseLeg2Dur;
     
-    let frequency = Math.ceil(totalRoundTripDuration / numBuses) || 10;
-    if (frequency < 1) frequency = 10;
+    // --- 1. FREQUENCY LOGIC ---
+    let effectiveFrequency;
+    if (frequencyDetails?.type === 'dynamic' && frequencyDetails.dynamicMinutes > 0) {
+        // If frequency is 'dynamic' and minutes are provided, use that value.
+        effectiveFrequency = Number(frequencyDetails.dynamicMinutes);
+    } else {
+        // Otherwise, calculate the frequency using the standard formula.
+        effectiveFrequency = Math.ceil(totalRoundTripDuration / numBuses);
+    }
+    if (!effectiveFrequency || effectiveFrequency < 1) {
+        effectiveFrequency = 10; // Default to 10 minutes if calculation is invalid.
+    }
+
+    // --- 2. DYNAMIC SHIFT START TIME LOGIC ---
+    const shiftStartTimes = [];
+    if (numShifts > 0) {
+        shiftStartTimes.push(parseTimeToMinutes(serviceStartTime));
+    }
+    for (let i = 1; i < numShifts; i++) {
+        // Check for the second shift specifically
+        if (i === 1 && hasDynamicSecondShift && secondShiftStartTime) {
+            // If it's the second shift and dynamic time is set, use it.
+            shiftStartTimes.push(parseTimeToMinutes(secondShiftStartTime));
+        } else {
+            // For all other subsequent shifts (3rd, 4th, etc.), chain them normally.
+            const prevShiftStartTime = shiftStartTimes[i - 1];
+            shiftStartTimes.push(prevShiftStartTime + (dutyHours * 60));
+        }
+    }
 
     let busStates = [];
-    for (let shiftIndex = 0; shiftIndex < numShifts; shiftIndex++) {
-        const shiftBlockStartTime = parseTimeToMinutes(serviceStartTime) + (shiftIndex * dutyHours * 60);
+    shiftStartTimes.forEach((shiftBlockStartTime, shiftIndex) => {
         for (let busIndex = 0; busIndex < numBuses; busIndex++) {
-            const dutyStart = shiftBlockStartTime + (busIndex * frequency);
+            const dutyStart = shiftBlockStartTime + (busIndex * effectiveFrequency);
             const busState = {
                 id: `Bus ${busIndex + 1} - S${shiftIndex + 1}`,
-                dutyStartTime: dutyStart, // Store the original planned start time
+                dutyStartTime: dutyStart,
                 schedule: [],
                 location: isTurnoutFromDepot ? depotName : fromTerminal,
                 availableFromTime: dutyStart,
@@ -88,7 +126,7 @@ function generateFullRouteSchedule(routeDetails) {
             busState.availableFromTime = dutyStart + 15;
             busStates.push(busState);
         }
-    }
+    });
     
     if (isTurnoutFromDepot) {
         busStates.forEach(busState => {
@@ -118,9 +156,8 @@ function generateFullRouteSchedule(routeDetails) {
         const currentLegBaseDur = isReturnTrip ? baseLeg2Dur : baseLeg1Dur;
         if (currentLegBaseDur <= 0 && isReturnTrip) { busToDispatch.isDone = true; continue; }
 
-        const dynamicHeadway = Math.max(1, Math.ceil(applyTimeAdjustments(busToDispatch.availableFromTime, totalRoundTripDuration, timeAdjustmentRules) / numBuses));
-        const lastDepartureTime = Math.max(...busStates.map(b => b.schedule.filter(e => e.type === 'Trip' && e.legs?.departureLocation === departureLocation).map(e => e.rawDepartureTime)).flat(), -1);
-        const idealDepartureTime = (lastDepartureTime > -1) ? lastDepartureTime + dynamicHeadway : busToDispatch.availableFromTime;
+        const lastDepartureTime = Math.max(...busStates.map(b => b.schedule.filter(e => e.type === 'Trip' && e.legs[0]?.departureLocation === departureLocation).map(e => e.rawDepartureTime)).flat(), -1);
+        const idealDepartureTime = (lastDepartureTime > -1) ? lastDepartureTime + effectiveFrequency : busToDispatch.availableFromTime;
         const actualDepartureTime = Math.max(idealDepartureTime, busToDispatch.availableFromTime);
         const legDuration = applyTimeAdjustments(actualDepartureTime, currentLegBaseDur, timeAdjustmentRules);
         const legEndTime = actualDepartureTime + legDuration;
@@ -167,7 +204,6 @@ function generateFullRouteSchedule(routeDetails) {
         busToDispatch.availableFromTime = newAvailableTime;
     }
     
-    // First Pass: Calculate and add final events
     busStates.forEach(bus => {
         let finalAvailableTime = bus.availableFromTime;
         if (isTurnoutFromDepot && bus.location !== depotName) {
@@ -189,62 +225,15 @@ function generateFullRouteSchedule(routeDetails) {
         bus.schedule.sort((a,b) => (a.rawTime ?? a.rawDepartureTime) - (b.rawTime ?? b.rawDepartureTime));
     });
 
-    // THE FIX IS HERE: Post-processing pass to correct subsequent shift start times
-    const actualEndTimesMap = {};
-    busStates.forEach(bus => {
-        const endEvent = bus.schedule.find(e => e.type === 'Duty End');
-        if (endEvent) {
-            actualEndTimesMap[bus.id] = endEvent.rawTime;
-        }
-    });
-
-    busStates.forEach(bus => {
-        const match = bus.id.match(/Bus (\d+) - S(\d+)/);
-        if (!match) return;
-
-        const busNumber = parseInt(match[1]);
-        const shiftNumber = parseInt(match[2]);
-
-        if (shiftNumber > 1) {
-            const prevShiftId = `Bus ${busNumber} - S${shiftNumber - 1}`;
-            const prevShiftActualEndTime = actualEndTimesMap[prevShiftId];
-            
-            if (prevShiftActualEndTime !== undefined) {
-                const currentShiftPlannedStartTime = bus.dutyStartTime;
-                const timeDifference = currentShiftPlannedStartTime - prevShiftActualEndTime;
-
-                if (timeDifference !== 0) {
-                    bus.schedule.forEach(event => {
-                        // Correct all raw time values
-                        if (event.rawTime !== undefined) event.rawTime -= timeDifference;
-                        if (event.rawDepartureTime !== undefined) event.rawDepartureTime -= timeDifference;
-                        if (event.rawArrivalTime !== undefined) event.rawArrivalTime -= timeDifference;
-
-                        // Correct all formatted time strings
-                        if (event.time) event.time = formatMinutesToTime(parseTimeToMinutes(event.time) - timeDifference);
-                        if (event.startTime) event.startTime = formatMinutesToTime(parseTimeToMinutes(event.startTime) - timeDifference);
-                        if (event.endTime) event.endTime = formatMinutesToTime(parseTimeToMinutes(event.endTime) - timeDifference);
-                        
-                        if (event.legs) {
-                            event.legs.forEach(leg => {
-                                if (leg.departureTime) leg.departureTime = formatMinutesToTime(parseTimeToMinutes(leg.departureTime) - timeDifference);
-                                if (leg.arrivalTime) leg.arrivalTime = formatMinutesToTime(parseTimeToMinutes(leg.arrivalTime) - timeDifference);
-                            });
-                        }
-                    });
-                }
-            }
-        }
-    });
-
     const finalSchedules = {};
     busStates.forEach(bus => {
         const [busId, shiftId] = bus.id.split(' - ');
         if (!finalSchedules[shiftId]) finalSchedules[shiftId] = {};
         finalSchedules[shiftId][bus.id] = bus.schedule;
     });
-    console.log('Final Schedules:', finalSchedules);
+
     return { schedules: finalSchedules, warnings: [] };
 }
+
 
 module.exports = { generateFullRouteSchedule };
