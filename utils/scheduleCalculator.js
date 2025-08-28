@@ -44,7 +44,7 @@ function generateFullRouteSchedule(routeDetails) {
         fromTerminal = 'Start', toTerminal = 'End', busesAssigned, numberOfShifts, dutyDurationHours,
         leg1, leg2, serviceStartTime = '00:00', timeAdjustmentRules = [], crewDutyRules = {},
         isTurnoutFromDepot = false, depotName = 'Depot', depotConnections = {}, frequency: frequencyDetails,
-        shiftType = 'standard', secondShift = {}, generalShift = {}
+        shiftType = 'standard', secondShift = {}, generalShift = {}, hasDynamicSecondShift = false, includeGeneralShift = false, secondShiftStartTime = '',
     } = routeDetails;
 
     const numBuses = parseInt(busesAssigned, 10) || 0;
@@ -64,6 +64,10 @@ function generateFullRouteSchedule(routeDetails) {
         effectiveFrequency = totalBusesForFrequency > 0 ? Math.ceil(totalRoundTripDuration / totalBusesForFrequency) : 10;
     }
 
+    // backend/utils/scheduleCalculator.js
+
+// Replace the "STEP 1" and "STEP 2" sections with this combined block:
+
     const mainFleetDuties = [];
     const lastShiftEndTimes = new Map();
 
@@ -74,8 +78,9 @@ function generateFullRouteSchedule(routeDetails) {
             if (shiftIndex === 1) {
                 currentShiftBlockStartTime = parseTimeToMinutes(serviceStartTime);
             } else {
-                if (shiftType === 'second' && shiftIndex === 2 && secondShift.startTime) {
-                    currentShiftBlockStartTime = parseTimeToMinutes(secondShift.startTime);
+                // Use the new boolean flag here
+                if (hasDynamicSecondShift && shiftIndex === 2 && secondShiftStartTime) {
+                    currentShiftBlockStartTime = parseTimeToMinutes(secondShiftStartTime);
                 } else {
                     const prevShiftEnds = Array.from(lastShiftEndTimes.values());
                     currentShiftBlockStartTime = prevShiftEnds.length > 0 ? prevShiftEnds.reduce((a, b) => a + b, 0) / prevShiftEnds.length : 0;
@@ -92,7 +97,8 @@ function generateFullRouteSchedule(routeDetails) {
 
     // STEP 2: Create duties for the general fleet (one-time only)
     const generalFleetDuties = [];
-    if (shiftType === 'general' && numGeneralBuses > 0 && generalShift.startTime) {
+    // Use the new boolean flag here
+    if (includeGeneralShift && numGeneralBuses > 0 && generalShift.startTime) {
         const generalStartTime = parseTimeToMinutes(generalShift.startTime);
         for (let i = 0; i < numGeneralBuses; i++) {
             const dutyStart = generalStartTime + (i * effectiveFrequency);
@@ -103,6 +109,7 @@ function generateFullRouteSchedule(routeDetails) {
             });
         }
     }
+
 
     const allDuties = [...mainFleetDuties, ...generalFleetDuties];
     allDuties.sort((a, b) => a.dutyStartTime - b.dutyStartTime);
