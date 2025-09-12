@@ -39,7 +39,11 @@ const generalShiftSchema = new mongoose.Schema({
     startTime: { type: String, default: '' }
 }, { _id: false });
 
-
+const customCallingTimeSchema = new mongoose.Schema({
+    busNumber: { type: String, required: true },
+    callingTime: { type: String, required: true, match: /^[0-2][0-9]:[0-5][0-9]$/ },
+    shift: { type: String, required: true }
+}, { _id: false });
 // --- MAIN ROUTE SCHEMA ---
 const busRouteSchema = new mongoose.Schema({
     // Your existing fields (unchanged)
@@ -68,6 +72,7 @@ const busRouteSchema = new mongoose.Schema({
         default: false
     },
     generalShift: generalShiftSchema,
+    customCallingTimes: [customCallingTimeSchema]
 
 }, { timestamps: true });
 
