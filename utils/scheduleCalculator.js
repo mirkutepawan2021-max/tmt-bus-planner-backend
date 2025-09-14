@@ -44,11 +44,12 @@ function generateFullRouteSchedule(routeDetails) {
         fromTerminal = 'Start', toTerminal = 'End', busesAssigned, numberOfShifts, dutyDurationHours,
         leg1, leg2, serviceStartTime = '00:00', timeAdjustmentRules = [], crewDutyRules = {},
         isTurnoutFromDepot = false, depotName = 'Depot', depotConnections = {}, frequency: frequencyDetails,
-        hasDynamicSecondShift = false, secondShiftStartTime = '', includeGeneralShift = false, generalShift = {}
+        secondShiftStartTime = '', includeGeneralShift = false, generalShift = {}
     } = routeDetails;
 
     const numBuses = parseInt(busesAssigned, 10) || 0;
-    const numShifts = parseInt(numberOfShifts, 10) || 1;
+    const numTotalShifts = parseInt(numberOfShifts, 10) || 1;
+    const customCallingTimes = routeDetails.customCallingTimes || [];
     const dutyHours = parseFloat(dutyDurationHours) || 8;
     const numGeneralBuses = parseInt(generalShift?.numberOfBuses, 10) || 0;
 
@@ -64,47 +65,58 @@ function generateFullRouteSchedule(routeDetails) {
         effectiveFrequency = totalBusesForFrequency > 0 ? Math.ceil(totalRoundTripDuration / totalBusesForFrequency) : 10;
     }
 
-    const mainFleetDuties = [];
-    const lastShiftEndTimes = new Map();
+    
+    const allDuties = []; // *** SINGLE, CORRECT DECLARATION ***
+    const lastDutyEndTimes = new Map();
 
-    if (numBuses > 0) {
-        for (let shiftIndex = 1; shiftIndex <= numShifts; shiftIndex++) {
-            let currentShiftBlockStartTime;
-            if (shiftIndex === 1) {
-                currentShiftBlockStartTime = parseTimeToMinutes(serviceStartTime);
-            } else {
-                if (hasDynamicSecondShift && shiftIndex === 2 && secondShiftStartTime) {
-                    currentShiftBlockStartTime = parseTimeToMinutes(secondShiftStartTime);
+    // 1. Handle the main fleet of buses
+    for (let i = 0; i < numBuses; i++) {
+        const busId = i + 1;
+        for (let shiftIndex = 0; shiftIndex < numTotalShifts; shiftIndex++) {
+             const busId = i + 1;
+            const shiftId = shiftIndex + 1;
+
+            const customTime = customCallingTimes.find(
+                cct => parseInt(cct.busNumber, 10) === busId && parseInt(cct.shift, 10) === shiftId
+            );
+
+            let dutyStart;
+            if (customTime?.callingTime) {
+                dutyStart = parseTimeToMinutes(customTime.callingTime);
+            } else if (i === 0) {
+                // First bus in shift: use serviceStartTime or previous shift's end
+                if (shiftIndex === 0) {
+                    dutyStart = parseTimeToMinutes(serviceStartTime);
                 } else {
-                    const prevShiftEnds = Array.from(lastShiftEndTimes.values());
-                    currentShiftBlockStartTime = prevShiftEnds.length > 0 ? prevShiftEnds.reduce((a, b) => a + b, 0) / prevShiftEnds.length : 0;
+                    // Find the same bus's duty end in previous shift
+                    const prevDuty = allDuties.find(
+                        d => d.id === `Bus ${busId} - S${shiftIndex}`
+                    );
+                    dutyStart = prevDuty ? prevDuty.dutyEndTime : parseTimeToMinutes(serviceStartTime);
                 }
+            } else {
+                // Not first bus in shift: previous bus's (in this shift) actual start + frequency
+                dutyStart = prevBusDutyStart + effectiveFrequency;
             }
-            for (let i = 0; i < numBuses; i++) {
-                const dutyStart = currentShiftBlockStartTime + (i * effectiveFrequency);
-                const dutyEnd = dutyStart + (dutyHours * 60);
-                mainFleetDuties.push({ id: `Bus ${i + 1} - S${shiftIndex}`, dutyStartTime: dutyStart, dutyEndTime: dutyEnd });
-                lastShiftEndTimes.set(i + 1, dutyEnd);
-            }
+            prevBusDutyStart = dutyStart;
+
+            const dutyEnd = dutyStart + (dutyHours * 60);
+            allDuties.push({ id: `Bus ${busId} - S${shiftId}`, dutyStartTime: dutyStart, dutyEndTime: dutyEnd });
+            lastDutyEndTimes.set(busId, dutyEnd);
         }
     }
 
-    const generalFleetDuties = [];
-    if (includeGeneralShift && numGeneralBuses > 0 && generalShift.startTime) {
+    // 2. Handle the general shift buses (if any)
+    if (numGeneralBuses > 0 && generalShift.startTime) {
         const generalStartTime = parseTimeToMinutes(generalShift.startTime);
         for (let i = 0; i < numGeneralBuses; i++) {
             const dutyStart = generalStartTime + (i * effectiveFrequency);
-            generalFleetDuties.push({
-                id: `General Bus ${i + 1} - S1`,
-                dutyStartTime: dutyStart,
-                dutyEndTime: dutyStart + (dutyHours * 60),
-            });
+            const dutyEnd = dutyStart + (dutyHours * 60);
+            allDuties.push({ id: `General Bus ${i + 1} - S1`, dutyStartTime: dutyStart, dutyEndTime: dutyEnd });
         }
     }
 
-    const allDuties = [...mainFleetDuties, ...generalFleetDuties];
     allDuties.sort((a, b) => a.dutyStartTime - b.dutyStartTime);
-
     allDuties.forEach(duty => {
         duty.schedule = [];
         duty.location = isTurnoutFromDepot ? depotName : fromTerminal;
@@ -176,7 +188,7 @@ function generateFullRouteSchedule(routeDetails) {
 
         const lastDepartureTime = Math.max(...allDuties.map(b => b.schedule.filter(e => e.type === 'Trip' && e.legs[0]?.departureLocation === departureLocation).map(e => e.rawDepartureTime)).flat(), -1);
         const idealDepartureTime = (lastDepartureTime > -1) ? lastDepartureTime + effectiveFrequency : busToDispatch.availableFromTime;
-        const actualDepartureTime = Math.max(idealDepartureTime, busToDispatch.availableFromTime);
+        const actualDepartureTime = busToDispatch.availableFromTime;
         const legDuration = applyTimeAdjustments(actualDepartureTime, currentLegBaseDur, timeAdjustmentRules);
         const legEndTime = actualDepartureTime + legDuration;
         const arrivalLocation = isReturnTrip ? fromTerminal : toTerminal;
