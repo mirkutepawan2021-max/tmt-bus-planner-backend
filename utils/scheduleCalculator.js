@@ -111,7 +111,8 @@ function generateFullRouteSchedule(routeDetails) {
 
         // Loop runs until finalized OR we run out of retries (then we force fit in fallback mode)
         while (!isFinalized) {
-            const isFallback = retries >= maxRetries;
+            const totalDrift = duty.dutyStartTime - duty.initialDutyStartTime;
+            const isFallback = retries >= maxRetries || totalDrift > 15;
 
             // 1. Reset State for this attempt
             duty.schedule = [];
@@ -205,6 +206,14 @@ function generateFullRouteSchedule(routeDetails) {
                             }
                         }
                     }
+
+                    // Extend duty end time by the amount we were forced to wait
+                    // This ensures we don't drop trips just because of slotting delays
+                    const forcedDelay = actualDepartureTime - nextDepartureTime;
+                    if (forcedDelay > 0) {
+                        duty.dutyEndTime += forcedDelay;
+                    }
+
                     // Update nextDepartureTime to the valid one
                     nextDepartureTime = actualDepartureTime;
                 } else {
@@ -275,7 +284,9 @@ function generateFullRouteSchedule(routeDetails) {
             // 4. Handle Retry or Finalize
             if (conflictFound && !isFallback) {
                 // Apply shift and retry
-                if (requiredShift > 30) requiredShift = 30; // Cap shift
+                // User requested max gap of ~10 mins (7, 8, 10).
+                if (requiredShift > 10) requiredShift = 10; // Cap shift at 10 mins
+
                 duty.dutyStartTime += requiredShift;
                 duty.dutyEndTime += requiredShift;
                 retries++;
