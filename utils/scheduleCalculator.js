@@ -63,18 +63,51 @@ function generateFullRouteSchedule(routeDetails) {
     const baseLeg2Dur = calculateLegDuration(leg2?.kilometers, leg2?.timePerKm) || 30;
     const totalRoundTripDuration = baseLeg1Dur + baseLeg2Dur;
     const baseStart = parseTimeToMinutes(serviceStartTime);
-    const baseFrequency = frequencyDetails?.dynamicMinutes > 0
-        ? Number(frequencyDetails.dynamicMinutes)
-        : (numBuses ? Math.ceil(totalRoundTripDuration / numBuses) : 12);
+
+    let baseFrequency;
+    if (frequencyDetails?.type === 'dynamic' && frequencyDetails.dynamicMinutes > 0) {
+        baseFrequency = Number(frequencyDetails.dynamicMinutes);
+    } else {
+        // Standard mode: Total Round Trip / Number of Buses
+        baseFrequency = (numBuses ? Math.ceil(totalRoundTripDuration / numBuses) : 12);
+    }
+
+    // BREAK RULES
+    // User Requirement: Break between 2.5h (150m) and 5h (300m)
+    const safetyBreakWindowStart = 150;
+    const safetyBreakWindowEnd = 300;
 
     const breakWindowStart = crewDutyRules?.breakWindowStart
-        ? parseTimeToMinutes(crewDutyRules.breakWindowStart)
-        : 3.5 * 60;
+        ? Math.max(parseTimeToMinutes(crewDutyRules.breakWindowStart), safetyBreakWindowStart)
+        : safetyBreakWindowStart;
+
+    // We enforce the 5h limit regardless of user input if it's too loose, 
+    // but typically we trust the user input unless it's missing. 
+    // However, the user explicitly asked to "take care of" the 5h limit.
+    const breakWindowEnd = safetyBreakWindowEnd;
+
     const breakDuration = crewDutyRules?.breakDuration
         ? parseTimeToMinutes(crewDutyRules.breakDuration)
         : 30;
     const breakLocation = crewDutyRules?.breakLocation || fromTerminal;
-    const callingStaggerMin = 2;
+    const callingStaggerMin = 0; // Constant frequency: no stagger
+
+    // Helper to snap time to the nearest frequency grid
+    function snapToGrid(time, start, freq) {
+        if (freq <= 0) return time;
+        const offset = time - start;
+        const remainder = offset % freq;
+        if (remainder === 0) return time;
+        return time + (freq - remainder);
+    }
+
+    // Helper to check for Peak Hours (7-11 AM, 4-8 PM)
+    function isPeakHour(timeInMinutes) {
+        // 07:00 = 420, 11:00 = 660
+        // 16:00 = 960, 20:00 = 1200
+        return (timeInMinutes >= 420 && timeInMinutes < 660) ||
+            (timeInMinutes >= 960 && timeInMinutes < 1200);
+    }
 
     // ---- GLOBAL LISTS of Finalized Departures ----
     const globalFromTerminalDepartures = [];
@@ -120,6 +153,7 @@ function generateFullRouteSchedule(routeDetails) {
             duty.availableFromTime = duty.dutyStartTime;
             duty.breakInserted = false;
             duty.tripCount = 0;
+            duty.totalBreakMinutes = 0; // Reset split break tracking
 
             const currentAttemptDeparturesFrom = [];
             const currentAttemptDeparturesTo = [];
@@ -161,28 +195,126 @@ function generateFullRouteSchedule(routeDetails) {
             while (true) {
                 let currentTime = duty.availableFromTime;
 
-                // Break Logic
-                if (
-                    !duty.breakInserted &&
-                    currentTime >= (duty.dutyStartTime + breakWindowStart) &&
-                    duty.location === breakLocation
-                ) {
-                    duty.schedule.push({
-                        type: 'Break',
-                        location: breakLocation,
-                        startTime: formatMinutesToTime(currentTime),
-                        endTime: formatMinutesToTime(currentTime + breakDuration),
-                        rawTime: currentTime
-                    });
-                    duty.availableFromTime = currentTime + breakDuration;
-                    duty.breakInserted = true;
-                    currentTime = duty.availableFromTime;
+                // ---- SMART BREAK & SPLIT LOGIC ----
+                // Calculate the Target Departure Time (Grid Slot) to see our available Dwell Time
+                let proposedDeparture = prevDeparture === null
+                    ? currentTime
+                    : Math.max(currentTime, prevDeparture + baseFrequency);
+                let targetDeparture = snapToGrid(proposedDeparture, baseStart, baseFrequency);
+
+                // If the target is in the past (due to processing), move to next slot
+                if (targetDeparture < currentTime) {
+                    targetDeparture += baseFrequency;
+                    targetDeparture = snapToGrid(targetDeparture, baseStart, baseFrequency);
                 }
 
-                // Proposed Departure
+                const dwellTime = targetDeparture - currentTime;
+                const timeOnDuty = currentTime - duty.dutyStartTime;
+                const nextLegDur = (duty.location === fromTerminal ? baseLeg1Dur : baseLeg2Dur);
+                const roundTripDur = baseLeg1Dur + baseLeg2Dur;
+
+                // Break Status
+                const totalBreakNeeded = breakDuration; // e.g. 30
+                const currentBreakTaken = duty.totalBreakMinutes || 0;
+                const remainingBreak = totalBreakNeeded - currentBreakTaken;
+                const isBreakFullyTaken = remainingBreak <= 0;
+
+                const canStartBreak = timeOnDuty >= 60; // Allow early starts for splitting
+                const mustFinishBreak = (timeOnDuty + nextLegDur) > breakWindowEnd;
+
+                // Peak Trap Check
+                const willLandInPeak = (
+                    ((currentTime + roundTripDur) >= 420 && (currentTime + roundTripDur) < 660) ||
+                    ((currentTime + roundTripDur) >= 960 && (currentTime + roundTripDur) < 1200)
+                );
+
+                if (!isBreakFullyTaken && duty.location === breakLocation && canStartBreak) {
+                    let breakToTake = 0;
+                    let breakType = 'Break';
+
+                    // STRATEGY 1: PEAK AVOIDANCE (High Priority)
+                    // If we are about to get trapped in peak, we usually must clear our break debt.
+                    // BUT, try to split it if possible (take 20m now, do a trip, take rest later).
+                    if (willLandInPeak) {
+                        const partialBreak = 20;
+                        const timeAfterPartial = currentTime + partialBreak;
+                        const tripEndAfterPartial = timeAfterPartial + roundTripDur;
+                        const landsInPeakAfterPartial = (
+                            (tripEndAfterPartial >= 420 && tripEndAfterPartial < 660) ||
+                            (tripEndAfterPartial >= 960 && tripEndAfterPartial < 1200)
+                        );
+
+                        if (remainingBreak > 20 && !landsInPeakAfterPartial) {
+                            breakToTake = partialBreak;
+                            breakType = 'Split Break (Peak Avoidance)';
+                        } else {
+                            breakToTake = remainingBreak;
+                            breakType = 'Early Break (Peak Avoidance)';
+                        }
+                    }
+                    // STRATEGY 2: FORCED SAFETY (High Priority)
+                    // If we are hitting the 5h limit, we MUST stop.
+                    // Try to take just 20m if it buys us enough time for one more trip.
+                    else if (mustFinishBreak) {
+                        const partialBreak = 20;
+                        const timeAfterPartial = currentTime + partialBreak;
+                        // Check if we can complete the next leg within the limit after this partial break
+                        // Note: The limit applies to 'timeOnDuty' at the END of the leg.
+                        // New timeOnDuty = (timeAfterPartial - duty.dutyStartTime) + nextLegDur
+                        const timeOnDutyAfterPartial = (timeAfterPartial - duty.dutyStartTime) + nextLegDur;
+
+                        if (remainingBreak > 20 && timeOnDutyAfterPartial <= breakWindowEnd) {
+                            breakToTake = partialBreak;
+                            breakType = 'Split Break (Safety)';
+                        } else {
+                            breakToTake = remainingBreak;
+                            breakType = 'Forced Break (Safety)';
+                        }
+                    }
+                    // STRATEGY 3: OPPORTUNISTIC SPLIT (Efficiency)
+                    // If we have dwell time (gap) waiting for the grid, use it for a break!
+                    // Cap at 20 mins to avoid large gaps even if dwell is huge (though dwell shouldn't be huge).
+                    else if (!isPeakHour(currentTime) && dwellTime >= 5) {
+                        breakToTake = Math.min(dwellTime, remainingBreak, 20);
+                        breakType = 'Split Break (Opportunistic)';
+                    }
+                    // STRATEGY 4: PROACTIVE FORCED SPLIT (Divide & Conquer)
+                    // If we are getting deep into duty (>1h) and still have a lot of break left,
+                    // force a chunk (max 20m) to avoid a huge drop later.
+                    else if (!isPeakHour(currentTime) && timeOnDuty >= 60 && remainingBreak > 10) {
+                        breakToTake = Math.min(20, remainingBreak);
+                        breakType = 'Split Break (Proactive)';
+                    }
+
+                    // EXECUTE BREAK
+                    if (breakToTake > 0) {
+                        duty.schedule.push({
+                            type: breakType,
+                            location: breakLocation,
+                            startTime: formatMinutesToTime(currentTime),
+                            endTime: formatMinutesToTime(currentTime + breakToTake),
+                            duration: breakToTake,
+                            rawTime: currentTime
+                        });
+
+                        currentTime += breakToTake;
+                        duty.totalBreakMinutes = (duty.totalBreakMinutes || 0) + breakToTake;
+                        duty.availableFromTime = currentTime;
+
+                        // If we finished the requirement, mark as done
+                        if (duty.totalBreakMinutes >= totalBreakNeeded) {
+                            duty.breakInserted = true;
+                        }
+                    }
+                }
+
+                // Proposed Departure - Snap to Grid!
                 let nextDepartureTime = prevDeparture === null
                     ? currentTime
                     : Math.max(currentTime, prevDeparture + baseFrequency);
+
+                // Enforce Grid Snapping
+                nextDepartureTime = snapToGrid(nextDepartureTime, baseStart, baseFrequency);
 
                 // ---- CONFLICT CHECK ----
                 const existingDepartures = (duty.location === fromTerminal)
@@ -201,6 +333,8 @@ function generateFullRouteSchedule(routeDetails) {
                             if (Math.abs(actualDepartureTime - existingTime) < baseFrequency) {
                                 // Conflict! Push forward to valid slot
                                 actualDepartureTime = existingTime + baseFrequency;
+                                // Ensure the new time is also on grid
+                                actualDepartureTime = snapToGrid(actualDepartureTime, baseStart, baseFrequency);
                                 valid = false;
                                 break; // Re-check against all because we moved
                             }
@@ -208,7 +342,6 @@ function generateFullRouteSchedule(routeDetails) {
                     }
 
                     // Extend duty end time by the amount we were forced to wait
-                    // This ensures we don't drop trips just because of slotting delays
                     const forcedDelay = actualDepartureTime - nextDepartureTime;
                     if (forcedDelay > 0) {
                         duty.dutyEndTime += forcedDelay;
@@ -231,6 +364,12 @@ function generateFullRouteSchedule(routeDetails) {
 
                 if (conflictFound && !isFallback) {
                     break; // Stop generating trips, restart duty
+                }
+
+                // If currentTime is still ahead of nextDepartureTime (due to break),
+                // we need to snap currentTime to the next valid grid slot
+                if (currentTime > nextDepartureTime) {
+                    nextDepartureTime = snapToGrid(currentTime, baseStart, baseFrequency);
                 }
 
                 // Calculate Leg Duration
@@ -284,7 +423,6 @@ function generateFullRouteSchedule(routeDetails) {
             // 4. Handle Retry or Finalize
             if (conflictFound && !isFallback) {
                 // Apply shift and retry
-                // User requested max gap of ~10 mins (7, 8, 10).
                 if (requiredShift > 10) requiredShift = 10; // Cap shift at 10 mins
 
                 duty.dutyStartTime += requiredShift;
