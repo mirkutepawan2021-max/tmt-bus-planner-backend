@@ -230,66 +230,14 @@ function generateFullRouteSchedule(routeDetails) {
 
                 if (!isBreakFullyTaken && duty.location === breakLocation && canStartBreak) {
                     let breakToTake = 0;
-                    let breakType = 'Break';
 
-                    // STRATEGY 1: PEAK AVOIDANCE (High Priority)
-                    // If we are about to get trapped in peak, we usually must clear our break debt.
-                    // BUT, try to split it if possible (take 20m now, do a trip, take rest later).
-                    if (willLandInPeak) {
-                        const partialBreak = 20;
-                        const timeAfterPartial = currentTime + partialBreak;
-                        const tripEndAfterPartial = timeAfterPartial + roundTripDur;
-                        const landsInPeakAfterPartial = (
-                            (tripEndAfterPartial >= 420 && tripEndAfterPartial < 660) ||
-                            (tripEndAfterPartial >= 960 && tripEndAfterPartial < 1200)
-                        );
+                    // Take as much break as needed
+                    breakToTake = Math.min(remainingBreak, breakDuration);
 
-                        if (remainingBreak > 20 && !landsInPeakAfterPartial) {
-                            breakToTake = partialBreak;
-                            breakType = 'Split Break (Peak Avoidance)';
-                        } else {
-                            breakToTake = remainingBreak;
-                            breakType = 'Early Break (Peak Avoidance)';
-                        }
-                    }
-                    // STRATEGY 2: FORCED SAFETY (High Priority)
-                    // If we are hitting the 5h limit, we MUST stop.
-                    // Try to take just 20m if it buys us enough time for one more trip.
-                    else if (mustFinishBreak) {
-                        const partialBreak = 20;
-                        const timeAfterPartial = currentTime + partialBreak;
-                        // Check if we can complete the next leg within the limit after this partial break
-                        // Note: The limit applies to 'timeOnDuty' at the END of the leg.
-                        // New timeOnDuty = (timeAfterPartial - duty.dutyStartTime) + nextLegDur
-                        const timeOnDutyAfterPartial = (timeAfterPartial - duty.dutyStartTime) + nextLegDur;
-
-                        if (remainingBreak > 20 && timeOnDutyAfterPartial <= breakWindowEnd) {
-                            breakToTake = partialBreak;
-                            breakType = 'Split Break (Safety)';
-                        } else {
-                            breakToTake = remainingBreak;
-                            breakType = 'Forced Break (Safety)';
-                        }
-                    }
-                    // STRATEGY 3: OPPORTUNISTIC SPLIT (Efficiency)
-                    // If we have dwell time (gap) waiting for the grid, use it for a break!
-                    // Cap at 20 mins to avoid large gaps even if dwell is huge (though dwell shouldn't be huge).
-                    else if (!isPeakHour(currentTime) && dwellTime >= 5) {
-                        breakToTake = Math.min(dwellTime, remainingBreak, 20);
-                        breakType = 'Split Break (Opportunistic)';
-                    }
-                    // STRATEGY 4: PROACTIVE FORCED SPLIT (Divide & Conquer)
-                    // If we are getting deep into duty (>1h) and still have a lot of break left,
-                    // force a chunk (max 20m) to avoid a huge drop later.
-                    else if (!isPeakHour(currentTime) && timeOnDuty >= 60 && remainingBreak > 10) {
-                        breakToTake = Math.min(20, remainingBreak);
-                        breakType = 'Split Break (Proactive)';
-                    }
-
-                    // EXECUTE BREAK
+                    // If we have something to take, record it
                     if (breakToTake > 0) {
                         duty.schedule.push({
-                            type: breakType,
+                            type: 'Break',
                             location: breakLocation,
                             startTime: formatMinutesToTime(currentTime),
                             endTime: formatMinutesToTime(currentTime + breakToTake),
@@ -308,172 +256,172 @@ function generateFullRouteSchedule(routeDetails) {
                     }
                 }
 
-                // Proposed Departure - Snap to Grid!
-                let nextDepartureTime = prevDeparture === null
-                    ? currentTime
-                    : Math.max(currentTime, prevDeparture + baseFrequency);
+// Proposed Departure - Snap to Grid!
+let nextDepartureTime = prevDeparture === null
+    ? currentTime
+    : Math.max(currentTime, prevDeparture + baseFrequency);
 
-                // Enforce Grid Snapping
-                nextDepartureTime = snapToGrid(nextDepartureTime, baseStart, baseFrequency);
+// Enforce Grid Snapping
+nextDepartureTime = snapToGrid(nextDepartureTime, baseStart, baseFrequency);
 
-                // ---- CONFLICT CHECK ----
-                const existingDepartures = (duty.location === fromTerminal)
-                    ? globalFromTerminalDepartures
-                    : globalToTerminalDepartures;
+// ---- CONFLICT CHECK ----
+const existingDepartures = (duty.location === fromTerminal)
+    ? globalFromTerminalDepartures
+    : globalToTerminalDepartures;
 
-                let actualDepartureTime = nextDepartureTime;
+let actualDepartureTime = nextDepartureTime;
 
-                if (isFallback) {
-                    // FALLBACK MODE: Force fit by shifting individual trip
-                    // Find the next valid slot that respects baseFrequency against ALL existing
-                    let valid = false;
-                    while (!valid) {
-                        valid = true;
-                        for (const existingTime of existingDepartures) {
-                            if (Math.abs(actualDepartureTime - existingTime) < baseFrequency) {
-                                // Conflict! Push forward to valid slot
-                                actualDepartureTime = existingTime + baseFrequency;
-                                // Ensure the new time is also on grid
-                                actualDepartureTime = snapToGrid(actualDepartureTime, baseStart, baseFrequency);
-                                valid = false;
-                                break; // Re-check against all because we moved
-                            }
-                        }
-                    }
-
-                    // Extend duty end time by the amount we were forced to wait
-                    const forcedDelay = actualDepartureTime - nextDepartureTime;
-                    if (forcedDelay > 0) {
-                        duty.dutyEndTime += forcedDelay;
-                    }
-
-                    // Update nextDepartureTime to the valid one
-                    nextDepartureTime = actualDepartureTime;
-                } else {
-                    // RETRY MODE: Check for conflict and abort if found
-                    for (const existingTime of existingDepartures) {
-                        if (Math.abs(nextDepartureTime - existingTime) < baseFrequency) {
-                            const targetTime = existingTime + baseFrequency;
-                            if (targetTime > nextDepartureTime) {
-                                requiredShift = Math.max(requiredShift, targetTime - nextDepartureTime);
-                                conflictFound = true;
-                            }
-                        }
-                    }
-                }
-
-                if (conflictFound && !isFallback) {
-                    break; // Stop generating trips, restart duty
-                }
-
-                // If currentTime is still ahead of nextDepartureTime (due to break),
-                // we need to snap currentTime to the next valid grid slot
-                if (currentTime > nextDepartureTime) {
-                    nextDepartureTime = snapToGrid(currentTime, baseStart, baseFrequency);
-                }
-
-                // Calculate Leg Duration
-                const legAdj = getWindowAdjustment(adjustmentArray, nextDepartureTime) || 0;
-                const baseLegDuration = (duty.location === fromTerminal ? baseLeg1Dur : baseLeg2Dur);
-                const legDuration = Math.max(1, baseLegDuration + legAdj);
-
-                const legEndTime = nextDepartureTime + legDuration;
-                const arrivalLocation = duty.location === fromTerminal ? toTerminal : fromTerminal;
-
-                // Check Duty End
-                let timeToReturnToDepot = 0;
-                if (isTurnoutFromDepot) {
-                    timeToReturnToDepot = arrivalLocation === fromTerminal
-                        ? parseFloat(depotConnections.timeFromStartToDepot) || 0
-                        : parseFloat(depotConnections.timeFromEndToDepot) || 0;
-                }
-                const postBuffer = timeToReturnToDepot + 15;
-                const cutoff = duty.dutyEndTime;
-
-                if (legEndTime + postBuffer > cutoff) {
-                    break;
-                }
-
-                // Add Trip
-                duty.tripCount++;
-                duty.schedule.push({
-                    type: 'Trip',
-                    tripNumber: duty.tripCount,
-                    legs: [{
-                        legNumber: duty.location === fromTerminal ? 1 : 2,
-                        departureTime: formatMinutesToTime(nextDepartureTime),
-                        rawDepartureTime: nextDepartureTime,
-                        departureLocation: duty.location,
-                        arrivalTime: formatMinutesToTime(nextDepartureTime + legDuration),
-                        arrivalLocation,
-                        legDuration: legDuration
-                    }],
-                    rawDepartureTime: nextDepartureTime,
-                    rawArrivalTime: nextDepartureTime + legDuration,
-                });
-
-                if (duty.location === fromTerminal) currentAttemptDeparturesFrom.push(nextDepartureTime);
-                else currentAttemptDeparturesTo.push(nextDepartureTime);
-
-                prevDeparture = nextDepartureTime;
-                duty.location = arrivalLocation;
-                duty.availableFromTime = nextDepartureTime + legDuration;
-            }
-
-            // 4. Handle Retry or Finalize
-            if (conflictFound && !isFallback) {
-                // Apply shift and retry
-                if (requiredShift > 10) requiredShift = 10; // Cap shift at 10 mins
-
-                duty.dutyStartTime += requiredShift;
-                duty.dutyEndTime += requiredShift;
-                retries++;
-            } else {
-                // Success (or Fallback completion)
-                currentAttemptDeparturesFrom.forEach(t => globalFromTerminalDepartures.push(t));
-                currentAttemptDeparturesTo.forEach(t => globalToTerminalDepartures.push(t));
-                isFinalized = true;
+if (isFallback) {
+    // FALLBACK MODE: Force fit by shifting individual trip
+    // Find the next valid slot that respects baseFrequency against ALL existing
+    let valid = false;
+    while (!valid) {
+        valid = true;
+        for (const existingTime of existingDepartures) {
+            if (Math.abs(actualDepartureTime - existingTime) < baseFrequency) {
+                // Conflict! Push forward to valid slot
+                actualDepartureTime = existingTime + baseFrequency;
+                // Ensure the new time is also on grid
+                actualDepartureTime = snapToGrid(actualDepartureTime, baseStart, baseFrequency);
+                valid = false;
+                break; // Re-check against all because we moved
             }
         }
+    }
 
-        // Add end-of-duty events
-        let currentTime = duty.availableFromTime;
-        if (isTurnoutFromDepot && duty.location !== depotName) {
-            const timeToDepot = duty.location === fromTerminal
-                ? parseFloat(depotConnections.timeFromStartToDepot) || 0
-                : parseFloat(depotConnections.timeFromEndToDepot) || 0;
-            const arrivalAtDepotTime = currentTime + timeToDepot;
-            if (timeToDepot > 0) {
-                duty.schedule.push({
-                    type: 'Trip to Depot',
-                    legs: [{
-                        departureTime: formatMinutesToTime(currentTime),
-                        arrivalTime: formatMinutesToTime(arrivalAtDepotTime),
-                        rawDepartureTime: currentTime,
-                        rawArrivalTime: arrivalAtDepotTime,
-                    }],
-                    rawDepartureTime: currentTime,
-                });
-                currentTime = arrivalAtDepotTime;
+    // Extend duty end time by the amount we were forced to wait
+    const forcedDelay = actualDepartureTime - nextDepartureTime;
+    if (forcedDelay > 0) {
+        duty.dutyEndTime += forcedDelay;
+    }
+
+    // Update nextDepartureTime to the valid one
+    nextDepartureTime = actualDepartureTime;
+} else {
+    // RETRY MODE: Check for conflict and abort if found
+    for (const existingTime of existingDepartures) {
+        if (Math.abs(nextDepartureTime - existingTime) < baseFrequency) {
+            const targetTime = existingTime + baseFrequency;
+            if (targetTime > nextDepartureTime) {
+                requiredShift = Math.max(requiredShift, targetTime - nextDepartureTime);
+                conflictFound = true;
             }
         }
-        const checkingTimeStart = currentTime;
-        const actualDutyEndTime = checkingTimeStart + 15;
-        duty.schedule.push({ type: 'Checking Time', time: formatMinutesToTime(checkingTimeStart), rawTime: checkingTimeStart });
-        duty.schedule.push({ type: 'Duty End', time: formatMinutesToTime(actualDutyEndTime), rawTime: actualDutyEndTime });
-        duty.schedule.sort((a, b) => (a.rawTime ?? a.rawDepartureTime) - (b.rawTime ?? b.rawDepartureTime));
+    }
+}
+
+if (conflictFound && !isFallback) {
+    break; // Stop generating trips, restart duty
+}
+
+// If currentTime is still ahead of nextDepartureTime (due to break),
+// we need to snap currentTime to the next valid grid slot
+if (currentTime > nextDepartureTime) {
+    nextDepartureTime = snapToGrid(currentTime, baseStart, baseFrequency);
+}
+
+// Calculate Leg Duration
+const legAdj = getWindowAdjustment(adjustmentArray, nextDepartureTime) || 0;
+const baseLegDuration = (duty.location === fromTerminal ? baseLeg1Dur : baseLeg2Dur);
+const legDuration = Math.max(1, baseLegDuration + legAdj);
+
+const legEndTime = nextDepartureTime + legDuration;
+const arrivalLocation = duty.location === fromTerminal ? toTerminal : fromTerminal;
+
+// Check Duty End
+let timeToReturnToDepot = 0;
+if (isTurnoutFromDepot) {
+    timeToReturnToDepot = arrivalLocation === fromTerminal
+        ? parseFloat(depotConnections.timeFromStartToDepot) || 0
+        : parseFloat(depotConnections.timeFromEndToDepot) || 0;
+}
+const postBuffer = timeToReturnToDepot + 15;
+const cutoff = duty.dutyEndTime;
+
+if (legEndTime + postBuffer > cutoff) {
+    break;
+}
+
+// Add Trip
+duty.tripCount++;
+duty.schedule.push({
+    type: 'Trip',
+    tripNumber: duty.tripCount,
+    legs: [{
+        legNumber: duty.location === fromTerminal ? 1 : 2,
+        departureTime: formatMinutesToTime(nextDepartureTime),
+        rawDepartureTime: nextDepartureTime,
+        departureLocation: duty.location,
+        arrivalTime: formatMinutesToTime(nextDepartureTime + legDuration),
+        arrivalLocation,
+        legDuration: legDuration
+    }],
+    rawDepartureTime: nextDepartureTime,
+    rawArrivalTime: nextDepartureTime + legDuration,
+});
+
+if (duty.location === fromTerminal) currentAttemptDeparturesFrom.push(nextDepartureTime);
+else currentAttemptDeparturesTo.push(nextDepartureTime);
+
+prevDeparture = nextDepartureTime;
+duty.location = arrivalLocation;
+duty.availableFromTime = nextDepartureTime + legDuration;
+            }
+
+// 4. Handle Retry or Finalize
+if (conflictFound && !isFallback) {
+    // Apply shift and retry
+    if (requiredShift > 10) requiredShift = 10; // Cap shift at 10 mins
+
+    duty.dutyStartTime += requiredShift;
+    duty.dutyEndTime += requiredShift;
+    retries++;
+} else {
+    // Success (or Fallback completion)
+    currentAttemptDeparturesFrom.forEach(t => globalFromTerminalDepartures.push(t));
+    currentAttemptDeparturesTo.forEach(t => globalToTerminalDepartures.push(t));
+    isFinalized = true;
+}
+        }
+
+// Add end-of-duty events
+let currentTime = duty.availableFromTime;
+if (isTurnoutFromDepot && duty.location !== depotName) {
+    const timeToDepot = duty.location === fromTerminal
+        ? parseFloat(depotConnections.timeFromStartToDepot) || 0
+        : parseFloat(depotConnections.timeFromEndToDepot) || 0;
+    const arrivalAtDepotTime = currentTime + timeToDepot;
+    if (timeToDepot > 0) {
+        duty.schedule.push({
+            type: 'Trip to Depot',
+            legs: [{
+                departureTime: formatMinutesToTime(currentTime),
+                arrivalTime: formatMinutesToTime(arrivalAtDepotTime),
+                rawDepartureTime: currentTime,
+                rawArrivalTime: arrivalAtDepotTime,
+            }],
+            rawDepartureTime: currentTime,
+        });
+        currentTime = arrivalAtDepotTime;
+    }
+}
+const checkingTimeStart = currentTime;
+const actualDutyEndTime = checkingTimeStart + 15;
+duty.schedule.push({ type: 'Checking Time', time: formatMinutesToTime(checkingTimeStart), rawTime: checkingTimeStart });
+duty.schedule.push({ type: 'Duty End', time: formatMinutesToTime(actualDutyEndTime), rawTime: actualDutyEndTime });
+duty.schedule.sort((a, b) => (a.rawTime ?? a.rawDepartureTime) - (b.rawTime ?? b.rawDepartureTime));
     });
 
-    const finalSchedules = {};
-    allDuties.forEach(bus => {
-        const idParts = bus.id.split(' - ');
-        const shiftId = idParts[1];
-        const busId = idParts[0];
-        if (!finalSchedules[shiftId]) finalSchedules[shiftId] = {};
-        finalSchedules[shiftId][busId] = bus.schedule;
-    });
+const finalSchedules = {};
+allDuties.forEach(bus => {
+    const idParts = bus.id.split(' - ');
+    const shiftId = idParts[1];
+    const busId = idParts[0];
+    if (!finalSchedules[shiftId]) finalSchedules[shiftId] = {};
+    finalSchedules[shiftId][busId] = bus.schedule;
+});
 
-    return { schedules: finalSchedules, warnings: [] };
+return { schedules: finalSchedules, warnings: [] };
 }
 
 module.exports = { generateFullRouteSchedule };
