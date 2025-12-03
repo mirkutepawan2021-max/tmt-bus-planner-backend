@@ -59,6 +59,8 @@ function generateFullRouteSchedule(routeDetails) {
     const adjustmentArray = timeAdjustmentRules || frequencyAdjustments || [];
     const numBuses = parseInt(busesAssigned, 10) || 0;
     const dutyHours = parseFloat(dutyDurationHours) || 8;
+    console.log(`[DEBUG] DutyDurationHours Input: ${dutyDurationHours}, Parsed: ${dutyHours}`);
+
     const baseLeg1Dur = calculateLegDuration(leg1?.kilometers, leg1?.timePerKm) || 30;
     const baseLeg2Dur = calculateLegDuration(leg2?.kilometers, leg2?.timePerKm) || 30;
     const totalRoundTripDuration = baseLeg1Dur + baseLeg2Dur;
@@ -178,6 +180,8 @@ function generateFullRouteSchedule(routeDetails) {
                 const canStartBreak = timeOnDuty >= 60;
                 const mustFinishBreak = (timeOnDuty + nextLegDur) > breakWindowEnd;
 
+                let justTookBreak = false;
+
                 if (!isBreakFullyTaken && duty.location === breakLocation && canStartBreak) {
                     let breakToTake = Math.min(remainingBreak, breakDuration);
                     if (breakToTake > 0) {
@@ -195,6 +199,7 @@ function generateFullRouteSchedule(routeDetails) {
                         if (duty.totalBreakMinutes >= totalBreakNeeded) {
                             duty.breakInserted = true;
                         }
+                        justTookBreak = true;
                     }
                 }
 
@@ -202,7 +207,7 @@ function generateFullRouteSchedule(routeDetails) {
                     ? currentTime
                     : Math.max(currentTime, prevDeparture + baseFrequency);
 
-                if (prevDeparture !== null) {
+                if (prevDeparture !== null && !justTookBreak) {
                     nextDepartureTime = snapToGrid(nextDepartureTime, baseStart, baseFrequency);
                 }
 
@@ -219,7 +224,9 @@ function generateFullRouteSchedule(routeDetails) {
                         for (const existingTime of existingDepartures) {
                             if (Math.abs(actualDepartureTime - existingTime) < baseFrequency) {
                                 actualDepartureTime = existingTime + baseFrequency;
-                                actualDepartureTime = snapToGrid(actualDepartureTime, baseStart, baseFrequency);
+                                if (!justTookBreak) {
+                                    actualDepartureTime = snapToGrid(actualDepartureTime, baseStart, baseFrequency);
+                                }
                                 valid = false;
                                 break;
                             }
@@ -247,14 +254,16 @@ function generateFullRouteSchedule(routeDetails) {
                 }
 
                 if (currentTime > nextDepartureTime) {
-                    nextDepartureTime = snapToGrid(currentTime, baseStart, baseFrequency);
+                    if (!justTookBreak) {
+                        nextDepartureTime = snapToGrid(currentTime, baseStart, baseFrequency);
+                    } else {
+                        nextDepartureTime = currentTime;
+                    }
                 }
 
-                const legAdj = getWindowAdjustment(adjustmentArray, nextDepartureTime) || 0;
+                // Fixed running time: strictly baseLegDuration, no adjustments
                 const baseLegDuration = (duty.location === fromTerminal ? baseLeg1Dur : baseLeg2Dur);
-
-                // Removed nonPeakAdj logic to enforce fixed running time
-                const legDuration = Math.max(1, baseLegDuration + legAdj);
+                const legDuration = baseLegDuration;
                 const legEndTime = nextDepartureTime + legDuration;
                 const arrivalLocation = duty.location === fromTerminal ? toTerminal : fromTerminal;
 
@@ -266,8 +275,9 @@ function generateFullRouteSchedule(routeDetails) {
                 }
                 const postBuffer = timeToReturnToDepot + 15;
                 const cutoff = duty.dutyEndTime;
+                const gracePeriod = 60; // Allow up to 60 mins overtime to complete a trip
 
-                if (legEndTime + postBuffer > cutoff) {
+                if (legEndTime + postBuffer > cutoff + gracePeriod) {
                     break;
                 }
 
@@ -326,7 +336,7 @@ function generateFullRouteSchedule(routeDetails) {
                     rawDepartureTime: currentTime,
                 });
                 currentTime = arrivalAtDepotTime;
-                duty.location = depotName; // Update location to Depot
+                duty.location = depotName;
             }
         }
         const checkingTimeStart = currentTime;
@@ -335,9 +345,7 @@ function generateFullRouteSchedule(routeDetails) {
         duty.schedule.push({ type: 'Duty End', time: formatMinutesToTime(actualDutyEndTime), rawTime: actualDutyEndTime });
         duty.schedule.sort((a, b) => (a.rawTime ?? a.rawDepartureTime) - (b.rawTime ?? b.rawDepartureTime));
 
-        // Update duty state for next shift linkage
         duty.availableFromTime = actualDutyEndTime;
-        // duty.location is already updated if went to depot, or remains at terminal
     }
 
     // --- MAIN EXECUTION ---
@@ -362,7 +370,6 @@ function generateFullRouteSchedule(routeDetails) {
 
     // Initialize and Process S2
     dutiesS1.forEach((dutyS1, i) => {
-        // S2 starts exactly when S1 ends (including Checking Time)
         const s1EndTime = dutyS1.availableFromTime;
         const dutyStartS2 = s1EndTime;
         const dutyEndS2 = dutyStartS2 + dutyHours * 60;
@@ -373,7 +380,7 @@ function generateFullRouteSchedule(routeDetails) {
             dutyStartTime: dutyStartS2,
             dutyEndTime: dutyEndS2,
             busIndex: i,
-            startLocation: dutyS1.location // Start where S1 ended
+            startLocation: dutyS1.location
         });
     });
 
