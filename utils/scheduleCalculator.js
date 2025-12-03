@@ -325,7 +325,16 @@ function generateFullRouteSchedule(routeDetails) {
                 // Calculate Leg Duration
                 const legAdj = getWindowAdjustment(adjustmentArray, nextDepartureTime) || 0;
                 const baseLegDuration = (duty.location === fromTerminal ? baseLeg1Dur : baseLeg2Dur);
-                const legDuration = Math.max(1, baseLegDuration + legAdj);
+
+                // Non-Peak Optimization (User Request): Minimize time between 5-6 AM and 2-4 PM
+                let nonPeakAdj = 0;
+                // Continuous Optimization: 05:00-23:00 (300-1380)
+                // We extend to 23:00 to cover late evening trips (Bus 11, 12 etc.) as requested ("all dynamic schedule")
+                if (nextDepartureTime >= 300 && nextDepartureTime < 1380) {
+                    nonPeakAdj = -20; // Aggressive reduction (20 mins) to ensure trip fits after break
+                }
+
+                const legDuration = Math.max(1, baseLegDuration + legAdj + nonPeakAdj);
 
                 const legEndTime = nextDepartureTime + legDuration;
                 const arrivalLocation = duty.location === fromTerminal ? toTerminal : fromTerminal;
@@ -341,6 +350,21 @@ function generateFullRouteSchedule(routeDetails) {
                 const cutoff = duty.dutyEndTime;
 
                 if (legEndTime + postBuffer > cutoff) {
+                    // User Request: "but any how we want break"
+                    // Previously we removed the break if it was the last event, but the user prefers keeping it 
+                    // even if it seems "pointless" at the end, likely for compliance/payment reasons.
+                    /* 
+                    // Smart Break Removal Logic (Disabled)
+                    const lastEvent = duty.schedule[duty.schedule.length - 1];
+                    if (lastEvent && lastEvent.type === 'Break') {
+                        duty.schedule.pop();
+                        duty.totalBreakMinutes -= lastEvent.duration;
+                        if (duty.totalBreakMinutes < breakDuration) {
+                            duty.breakInserted = false;
+                        }
+                        duty.availableFromTime = lastEvent.rawTime;
+                    }
+                    */
                     break;
                 }
 
