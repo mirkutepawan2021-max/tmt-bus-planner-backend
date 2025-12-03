@@ -132,11 +132,6 @@ function generateFullRouteSchedule(routeDetails) {
             });
             duty.availableFromTime = duty.dutyStartTime + 15;
 
-            // Only add Depot Movement if we are starting from Depot AND it's a Turnout (S1)
-            // OR if S2 is starting at Depot (handed over from S1 at Depot)
-            // But if S2 starts at Depot, does it need "Depot Movement" to Terminal?
-            // Yes, if it's at Depot, it needs to get to Terminal to start trips.
-            // Logic: If location is Depot, move to Terminal.
             if (duty.location === depotName) {
                 const timeToStart = parseFloat(depotConnections.timeFromDepotToStart) || 0;
                 const arrivalAtStartTime = duty.availableFromTime + timeToStart;
@@ -258,12 +253,8 @@ function generateFullRouteSchedule(routeDetails) {
                 const legAdj = getWindowAdjustment(adjustmentArray, nextDepartureTime) || 0;
                 const baseLegDuration = (duty.location === fromTerminal ? baseLeg1Dur : baseLeg2Dur);
 
-                let nonPeakAdj = 0;
-                if (nextDepartureTime >= 300 && nextDepartureTime < 1380) {
-                    nonPeakAdj = -20;
-                }
-
-                const legDuration = Math.max(1, baseLegDuration + legAdj + nonPeakAdj);
+                // Removed nonPeakAdj logic to enforce fixed running time
+                const legDuration = Math.max(1, baseLegDuration + legAdj);
                 const legEndTime = nextDepartureTime + legDuration;
                 const arrivalLocation = duty.location === fromTerminal ? toTerminal : fromTerminal;
 
