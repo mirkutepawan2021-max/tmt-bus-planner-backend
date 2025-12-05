@@ -60,6 +60,7 @@ function generateFullRouteSchedule(routeDetails) {
     const numBuses = parseInt(busesAssigned, 10) || 0;
     const dutyHours = parseFloat(dutyDurationHours) || 8;
     console.log(`[DEBUG] DutyDurationHours Input: ${dutyDurationHours}, Parsed: ${dutyHours}`);
+    console.log(`[DEBUG] Depot Connections:`, depotConnections);
 
     const baseLeg1Dur = calculateLegDuration(leg1?.kilometers, leg1?.timePerKm) || 30;
     const baseLeg2Dur = calculateLegDuration(leg2?.kilometers, leg2?.timePerKm) || 30;
@@ -273,11 +274,17 @@ function generateFullRouteSchedule(routeDetails) {
                         ? parseFloat(depotConnections.timeFromStartToDepot) || 0
                         : parseFloat(depotConnections.timeFromEndToDepot) || 0;
                 }
-                const postBuffer = timeToReturnToDepot + 15;
-                const cutoff = duty.dutyEndTime;
-                const gracePeriod = 60; // Allow up to 60 mins overtime to complete a trip
 
-                if (legEndTime + postBuffer > cutoff + gracePeriod) {
+                // Only reserve checking time (15 mins) - depot return happens after trips end
+                const reservedEndBuffer = 15; // Just checking time
+                const cutoff = duty.dutyEndTime;
+
+                // Check if trip + depot return + checking would exceed duty end
+                // Smart buffer: cap at 60 min to prevent overly conservative cutoffs
+                const smartBuffer = 0; // No buffer - schedule trips until they don't fit
+                const cutoffWithBuffer = cutoff - smartBuffer;
+                if (legEndTime > cutoffWithBuffer) {
+                    console.log(`[TRIP CUTOFF] ${duty.id}: tripEnd=${formatMinutesToTime(legEndTime)}, cutoffWithBuffer=${formatMinutesToTime(cutoffWithBuffer)} (duty=${formatMinutesToTime(cutoff)}, smartBuffer=${smartBuffer}min [depot=${timeToReturnToDepot}, check=${reservedEndBuffer}])`);
                     break;
                 }
 
@@ -323,24 +330,44 @@ function generateFullRouteSchedule(routeDetails) {
             const timeToDepot = duty.location === fromTerminal
                 ? parseFloat(depotConnections.timeFromStartToDepot) || 0
                 : parseFloat(depotConnections.timeFromEndToDepot) || 0;
-            const arrivalAtDepotTime = currentTime + timeToDepot;
+            // Cap depot time at 30 min max for realistic movements
+            const realisticDepotTime = Math.min(timeToDepot, 30);
+            const arrivalAtDepotTime = currentTime + realisticDepotTime;
+            // Cap at duty end to prevent exceeding duty hours
+            const cappedArrivalTime = Math.min(arrivalAtDepotTime, duty.dutyEndTime - 15);
             if (timeToDepot > 0) {
                 duty.schedule.push({
                     type: 'Trip to Depot',
                     legs: [{
                         departureTime: formatMinutesToTime(currentTime),
-                        arrivalTime: formatMinutesToTime(arrivalAtDepotTime),
+                        arrivalTime: formatMinutesToTime(cappedArrivalTime),
                         rawDepartureTime: currentTime,
-                        rawArrivalTime: arrivalAtDepotTime,
+                        rawArrivalTime: cappedArrivalTime,
                     }],
                     rawDepartureTime: currentTime,
                 });
-                currentTime = arrivalAtDepotTime;
+                currentTime = cappedArrivalTime;
+                // STRICT: Ensure we never exceed duty end
+                if (currentTime > duty.dutyEndTime) {
+                    console.log(`[DEPOT CAP] ${duty.id}: Depot arrival ${formatMinutesToTime(currentTime)} exceeds duty end ${formatMinutesToTime(duty.dutyEndTime)}, capping`);
+                    currentTime = duty.dutyEndTime;
+                }
                 duty.location = depotName;
             }
         }
-        const checkingTimeStart = currentTime;
-        const actualDutyEndTime = checkingTimeStart + 15;
+        // Checking happens immediately after last activity
+        let checkingTimeStart = currentTime;
+
+        // STRICT: Ensure duty end does NOT exceed specified duty hours
+        const maxAllowedDutyEnd = duty.dutyEndTime;
+        let actualDutyEndTime = checkingTimeStart + 15;
+
+        // If adding checking would exceed duty hours, cap it
+        if (actualDutyEndTime > maxAllowedDutyEnd) {
+            console.log(`[DUTY END CAP] ${duty.id}: Would end at ${formatMinutesToTime(actualDutyEndTime)}, capping to ${formatMinutesToTime(maxAllowedDutyEnd)}`);
+            actualDutyEndTime = maxAllowedDutyEnd;
+            checkingTimeStart = maxAllowedDutyEnd - 15;
+        }
         duty.schedule.push({ type: 'Checking Time', time: formatMinutesToTime(checkingTimeStart), rawTime: checkingTimeStart });
         duty.schedule.push({ type: 'Duty End', time: formatMinutesToTime(actualDutyEndTime), rawTime: actualDutyEndTime });
         duty.schedule.sort((a, b) => (a.rawTime ?? a.rawDepartureTime) - (b.rawTime ?? b.rawDepartureTime));
